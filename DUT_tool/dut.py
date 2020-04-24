@@ -1,39 +1,20 @@
 import os
 import time
 import re
+import numpy as np
 import sys
 import socket
 import serial
 import struct
 import logging
 import time
+import datetime
 import string
 import win32process
 import win32event
 import pywintypes
+import pprint
 
-DUT_COMPORT = "COM3"
-DUT_DISPLAYSLEEPTIME = 0.1
-DUT_RENDER_ONE_IMAGE_TIMEOUT = 0
-COMMAND_DISP_HELP = "$c.help"
-COMMAND_DISP_VERSION_GRP=['mcu','hw','fpga']
-COMMAND_DISP_VERSION = "Version"
-COMMAND_DISP_GETBOARDID = "getBoardID"
-COMMAND_DISP_POWERON = "DUT.powerOn,FPGA_compressMode"
-# COMMAND_DISP_POWERON = "DUT.powerOn,SSD2832_BistMode"
-COMMAND_DISP_POWEROFF = "DUT.powerOff"
-COMMAND_DISP_RESET = "Reset"
-COMMAND_DISP_SETCOLOR = "SetColor"
-COMMAND_DISP_SHOWIMAGE = "ShowImage"
-COMMAND_DISP_READ = "MIPI.Read"
-COMMAND_DISP_WRITE = "MIPI.Write"
-COMMAND_DISP_2832WRITE = "t.2832_MIPI_WRITE"
-COMMAND_DISP_VSYNC="REFRESHRATE"
-
-COMMAND_DISP_POWERON_DLY = 1.5
-COMMAND_DISP_RESET_DLY = 1
-COMMAND_DISP_SHOWIMG_DLY = 1
-COMMAND_DISP_POWEROFF_DLY = 0.2
 
 class DUTError(Exception):
     def __init__(self, value):
@@ -43,22 +24,25 @@ class DUTError(Exception):
     def __str__(self):
         return repr(self.value)
 
-class pancakeDut():
-    def __init__(self, serialNumber):
+class pancakeDut(object):
+    def __init__(self, serialNumber, station_config, operator_interface):
+        self._station_config = station_config
+        self._operator_interface = operator_interface
+        # hardware_station_common.test_station.dut.DUT.__init__(self, serialNumber, station_config, operatorInterface)
         self.first_boot = True
+        self._verbose = station_config.IS_VERBOSE
         self.is_screen_poweron = False
-        self._serial_number = serialNumber
-        self._serial_port = None
+        self._serial_port = None # type: serial.Serial
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logging.DEBUG)
         self._start_delimiter = "$"
-        self._end_delimiter = '\r\n'
+        self._end_delimiter = b'\r\n'
         self._spliter = ','
         self._renderImgTool = os.path.join(os.getcwd(), r'CambriaToos\exe\CambriaTools-cmd.exe')
 
     def initialize(self):
         self.is_screen_poweron = False
-        self._serial_port = serial.Serial(self._serial_number,
+        self._serial_port = serial.Serial(self._station_config.DUT_COMPORT,
                                           baudrate=115200,
                                           bytesize=serial.EIGHTBITS,
                                           parity=serial.PARITY_NONE,
@@ -69,15 +53,15 @@ class pancakeDut():
                                           timeout=1,
                                           writeTimeout=None,
                                           interCharTimeout=None)
-
         if not self._serial_port:
-            raise DUTError('Unable to open DUT port : %s' % self._serial_number)
+            raise DUTError('Unable to open DUT port : %s' % self._station_config.DUT_COMPORT)
             return False
         else:
-            print ('DUT %s Initialised. ' % self._serial_port)
+            self.first_boot = True
+            if self._verbose:
+                print('DUT %s Initialised. ' % self._station_config.DUT_COMPORT)
             return True
         return False
-
 
     def connect_display(self, display_cycle_time=2, launch_time=4):
         if self.first_boot:
@@ -101,7 +85,7 @@ class pancakeDut():
             time.sleep(0.5)
             recvobj = self._power_on()
             if recvobj is None:
-                print ("Exit power_on because can't receive any data from dut.")
+                raise RuntimeError("Exit power_on because can't receive any data from dut.")
             else:
                 self.is_screen_poweron = True
                 if recvobj[0] != '0000':
@@ -110,19 +94,14 @@ class pancakeDut():
 
     def screen_off(self):
         if self.is_screen_poweron:
-            recvobj = self._power_off()
-            if recvobj is None:
-                raise RuntimeError("Exit power_off because can't receive any data from dut.")
-            elif int(recvobj[0]) != 0x00:
-                raise DUTError("Exit power_off because rev err msg. Msg = {}".format(recvobj))
-            else:
-                self.is_screen_poweron = False
+            self._power_off()
+            self.is_screen_poweron = False
 
     def close(self):
-        print ("Turn Off display................\n")
+        self._operator_interface.print_to_console("Turn Off display................\n")
         if self.is_screen_poweron:
             self._power_off()
-        print ("Closing DUT by the communication interface.\n")
+        self._operator_interface.print_to_console("Closing DUT by the communication interface.\n")
         if self._serial_port is not None:
             self._serial_port.close()
             self._serial_port = None
@@ -134,7 +113,7 @@ class pancakeDut():
                 raise RuntimeError("Exit display_color because can't receive any data from dut.")
             elif int(recvobj[0]) != 0x00:
                 raise RuntimeError("Exit display_color because rev err msg. Msg = {}".format(recvobj))
-        time.sleep(DUT_DISPLAYSLEEPTIME)
+        time.sleep(self._station_config.DUT_DISPLAYSLEEPTIME)
 
     def display_image(self, image, is_ddr_data=False):
         recvobj = self._showImage(image, is_ddr_data)
@@ -142,7 +121,7 @@ class pancakeDut():
             raise RuntimeError("Exit disp_image because can't receive any data from dut.")
         elif int(recvobj[0]) != 0x00:
             raise DUTError("Exit disp_image because rev err msg. Msg = {}".format(recvobj))
-        time.sleep(DUT_DISPLAYSLEEPTIME)
+        time.sleep(self._station_config.DUT_DISPLAYSLEEPTIME)
 
     def vsync_microseconds(self):
         recvobj = self._vsyn_time()
@@ -166,7 +145,38 @@ class pancakeDut():
         if isinstance(pics, list):
             cmd = os.path.basename(self._renderImgTool) + ' -push ' + \
                   ' '.join([os.path.abspath(c) for c in pics])
-            return self._timeout_execute(cmd, len(pics) * DUT_RENDER_ONE_IMAGE_TIMEOUT)
+            return self._timeout_execute(cmd, len(pics) * self._station_config.DUT_RENDER_ONE_IMAGE_TIMEOUT)
+
+    def reboot(self):
+        delay_seconds = 40
+        if hasattr(self._station_config, 'COMMAND_DISP_REBOOT_DLY'):
+            delay_seconds = self._station_config.COMMAND_DISP_REBOOT_DLY
+        sw = datetime.datetime.now()
+
+        recvobj = self._reboot()
+        self.is_screen_poweron = False
+        if recvobj is None:
+            raise RuntimeError("Fail to reboot because can't receive any data from dut.")
+        elif int(recvobj[0]) != 0x00:
+            raise DUTError("Fail to reboot because rev err msg. Msg = {}".format(recvobj))
+
+        while True:
+            dt = datetime.datetime.now()
+            if (dt - sw).total_seconds() > delay_seconds:
+                raise DUTError('Fail to reboot because waiting msg timeout {0:4f}s. '.format((dt - sw).total_seconds()))
+            response = self._serial_port.readline()
+            if response is None or len(response) <= 0:
+                time.sleep(1)
+                if self._verbose:
+                    print('.')
+                continue
+            recvobj = self._prase_respose('System OK', response)
+            if int(recvobj[0]) == 0x00:
+                if self._verbose:
+                    print('Reboot system successfully . Elapse time {0:4f} s.'.format((dt - sw).total_seconds()))
+                break
+            else:
+                raise DUTError("Fail to reboot because rev err msg. Msg = {}".format(recvobj))
 
     # <editor-fold desc='InternalCommand'>
 
@@ -193,61 +203,65 @@ class pancakeDut():
                     raise DUTError('exectue {} timeout :{}'.format(cmd, e))
                 if rc == win32event.WAIT_OBJECT_0:
                     res = win32process.GetExitCodeProcess(handle[0])
+            else:
+                res = 0
         finally:
             os.chdir(cwd)
-        print ('_timeout_execute ')
+        if res != 0:
+            raise DUTError('fail to exec {} res :{}'.format(cmd, res))
         return res
-
-    def _write_serial(self, input_bytes):
-        bytes_written = self._serial_port.write(input_bytes)
-        self._serial_port.flush()
-        return bytes_written
 
     def _write_serial_cmd(self, command):
         cmd = '$c.{}\r\n'.format(command)
-        self._serial_port.write(str.encode(cmd))
-        self._serial_port.flush()
+        if self._verbose:
+            print('send command ----------> {}'.format(cmd))
 
-    def _read_response(self):
+        self._serial_port.flush()
+        self._serial_port.write(cmd.encode('utf-8'))
+
+    def _read_response(self, timeout=5):
         response = []
-        while True:
+        line_in = b''
+        tim = time.time()
+        while (not re.search(self._end_delimiter, line_in, re.IGNORECASE)
+               and (time.time() - tim < timeout)):
             line_in = self._serial_port.readline()
             if line_in != b'':
-                response.append(line_in.decode('utf-8'))
-            else:
-                break
-        print ("<--- {}".format(response))
+                response.append(line_in.decode())
+        if self._verbose and len(response) > 1:
+            pprint.pprint(response)
         return response
 
     def _vsyn_time(self):
-        self._write_serial_cmd(COMMAND_DISP_VSYNC)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_VSYNC)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_VSYNC, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_VSYNC, response)
 
     def _help(self):
-        self._write_serial_cmd(COMMAND_DISP_HELP)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_HELP)
         time.sleep(1)
         response = self._read_response()
-        print (response)
+        if self._verbose:
+            print(response)
         value = []
         for item in response[0:len(response)-1]:
             value.append(item)
         return value
 
     def _version(self, model_name):
-        self._write_serial_cmd("%s,%s"%(COMMAND_DISP_VERSION,model_name))
+        self._write_serial_cmd("%s,%s"%(self._station_config.COMMAND_DISP_VERSION,model_name))
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_VERSION, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_VERSION, response)
 
     def _get_boardId(self):
-        self._write_serial_cmd(COMMAND_DISP_GETBOARDID)
-        time.sleep(1)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_GETBOARDID)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_GETBOARDID, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_GETBOARDID, response)
 
     def _prase_respose(self, command, response):
 
-        print ("command : {},,,{}".format(command, response))
+        if self._verbose:
+            print("command : {},,,{}".format(command, response))
 
         if response is None:
             return None
@@ -259,75 +273,144 @@ class pancakeDut():
         values = respstr.split(self._spliter)
         if len(values) == 1:
             raise RuntimeError('display ctrl rev data format error. <- ' + respstr)
-
-
-        return  values[1:]
+        return values[1:]
 
     def _power_on(self):
-        self._write_serial_cmd(COMMAND_DISP_POWERON)
-        time.sleep(COMMAND_DISP_POWERON_DLY)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_POWERON)
+        time.sleep(self._station_config.COMMAND_DISP_POWERON_DLY)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_POWERON, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_POWERON, response)
 
     def _power_off(self):
-        self._write_serial_cmd(COMMAND_DISP_POWEROFF)
-        time.sleep(COMMAND_DISP_POWEROFF_DLY)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_POWEROFF)
+        time.sleep(self._station_config.COMMAND_DISP_POWEROFF_DLY)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_POWEROFF, response)
+        # return self._prase_respose(self._station_config.COMMAND_DISP_POWEROFF, response)
 
     def _reset(self):
-        self._write_serial_cmd(COMMAND_DISP_RESET)
-        time.sleep(COMMAND_DISP_RESET_DLY)
+        self._write_serial_cmd(self._station_config.COMMAND_DISP_RESET)
+        time.sleep(self._station_config.COMMAND_DISP_RESET_DLY)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_RESET, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_RESET, response)
 
-    def _showImage(self, imageindex, is_ddr_img):
-        # type: (int, bool)->str
+    def _showImage(self, image_index, is_ddr_img):
+        # type: (int, bool) -> str
         command = ''
-        if isinstance(imageindex, str):
-            command ='{},{}'.format(COMMAND_DISP_SHOWIMAGE, imageindex)
-        elif isinstance(imageindex, int):
+        if isinstance(image_index, str):
+            command = '{},{}'.format(self._station_config.COMMAND_DISP_SHOWIMAGE, image_index)
+        elif isinstance(image_index, int):
             if is_ddr_img:
-                imageindex = 0x20 + imageindex
-            command = '{},{}'.format(COMMAND_DISP_SHOWIMAGE, hex(imageindex))
+                image_index = 0x20 + image_index
+            command = '{},{}'.format(self._station_config.COMMAND_DISP_SHOWIMAGE, hex(image_index))
         self._write_serial_cmd(command)
-        time.sleep(COMMAND_DISP_SHOWIMG_DLY)
+        time.sleep(self._station_config.COMMAND_DISP_SHOWIMG_DLY)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_SHOWIMAGE, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_SHOWIMAGE, response)
 
-    def _setColor(self, c = (255,255,255)):
-        command = '{0},0x{1[0]:X},0x{1[1]:X},0x{1[2]:X}'.format(COMMAND_DISP_SETCOLOR, c)
+    def _setColor(self, c=(255, 255, 255)):
+        command = '{0},0x{1[0]:02X},0x{1[1]:02X},0x{1[2]:02X}'.format(self._station_config.COMMAND_DISP_SETCOLOR, c)
         self._write_serial_cmd(command)
-        time.sleep(1)
+        time.sleep(0.02)
         response = self._read_response()
-        return self._prase_respose(COMMAND_DISP_SETCOLOR, response)
+        return self._prase_respose(self._station_config.COMMAND_DISP_SETCOLOR, response)
+
+    def _MIPI_read(self, reg, typ):
+        command = '{0},{1},{2}'.format(self._station_config.COMMAND_DISP_READ, reg, typ)
+        self._write_serial_cmd(command)
+        # time.sleep(1)
+        response = self._read_response()
+        return self._prase_respose(self._station_config.COMMAND_DISP_READ, response)
+
+    def _MIPI_write(self, reg, typ, val):
+        command = '{0},{1},{2},{3}'.format(self._station_config.COMMAND_DISP_WRITE, reg, typ, val)
+        self._write_serial_cmd(command)
+        #time.sleep(1)
+        response = self._read_response()
+        return self._prase_respose(self._station_config.COMMAND_DISP_WRITE, response)
+
+    def _reboot(self):
+        cmd = 'Reboot'
+        if hasattr(self._station_config, 'COMMAND_REBOOT'):
+            cmd = self._station_config.COMMAND_REBOOT
+        self._write_serial_cmd(cmd)
+        response = self._read_response()
+        return self._prase_respose(cmd, response)
 
     # </editor-fold>
 
+def print_to_console(self, msg):
+    pass
+
 if __name__ == "__main__" :
+
+    class cfgstub(object):
+        pass
+
+    station_config = cfgstub()
+    station_config.DUT_COMPORT = "COM3"
+    station_config.DUT_DISPLAYSLEEPTIME = 0.1
+    station_config.DUT_RENDER_ONE_IMAGE_TIMEOUT = 0
+    station_config.COMMAND_DISP_HELP = "$c.help"
+    station_config.COMMAND_DISP_VERSION_GRP = ['mcu', 'hw', 'fpga']
+    station_config.COMMAND_DISP_VERSION = "Version"
+    station_config.COMMAND_DISP_GETBOARDID = "getBoardID"
+    station_config.COMMAND_DISP_POWERON = "DUT.powerOn,FPGA_compressMode"
+    # COMMAND_DISP_POWERON = "DUT.powerOn,SSD2832_BistMode"
+    station_config.COMMAND_DISP_POWEROFF = "DUT.powerOff"
+    station_config.COMMAND_DISP_RESET = "Reset"
+    station_config.COMMAND_DISP_SETCOLOR = "SetColor"
+    station_config.COMMAND_DISP_SHOWIMAGE = "ShowImage"
+    station_config.COMMAND_DISP_READ = "MIPI.Read"
+    station_config.COMMAND_DISP_WRITE = "MIPI.Write"
+    station_config.COMMAND_DISP_2832WRITE = "t.2832_MIPI_WRITE"
+    station_config.COMMAND_DISP_VSYNC = "REFRESHRATE"
+    station_config.COMMAND_DISP_POWERON_DLY = 1.5
+    station_config.COMMAND_DISP_RESET_DLY = 1
+    station_config.COMMAND_DISP_SHOWIMG_DLY = 0.5
+    station_config.COMMAND_DISP_POWEROFF_DLY = 0.2
+
     import sys
     import types
-    import logging
-    the_unit = None
+    sys.path.append(r'..\..')
 
-    try:
-        the_unit = pancakeDut(DUT_COMPORT)
+    station_config.print_to_console = types.MethodType(print_to_console, station_config)
+    station_config.IS_VERBOSE = True
+
+    the_unit = pancakeDut(station_config, station_config, station_config)
+    for idx in range(0, 100):
+
+        print('Loop ---> {}'.format(idx))
+
+        pics = []
+        if os.path.exists('img'):
+            for c in os.listdir('img'):
+                if c.endswith(".bmp"):
+                    pics.append(r'img\{}'.format(c))
+
+        print('pic - count {0}'.format(len(pics)))
+
+        # the_unit.render_image(pics)
         the_unit.initialize()
-
-        for idx in range(0, 2):
-            print ('Loop ---> {}'.format(idx))
-            pics = []
-
+        try:
+            # the_unit.reboot()
             the_unit.connect_display()
-            # for c in [(0, 0, 0), (255, 255, 255), (255, 0, 0), (0, 255, 0), (0, 0, 255)]:
-            for c in range(0, 23):
-                the_unit.display_image(c, True)
-                # the_unit.display_color(c)
+            time.sleep(0.5)
+            # the_unit.screen_on()
+            # time.sleep(1)
+            # the_unit.display_color()
+            # time.sleep(1)
+            # print(the_unit.vsync_microseconds())
+            for c in [(0, 0, 0), (255, 255, 255), (255, 0, 0), (0, 255, 0), (0, 0, 255)]:
+                the_unit.display_color(c)
                 time.sleep(0.1)
+
+            # for c in range(0, len(pics)): # DDR Image
+            for c in range(0, 5):
+                the_unit.display_image(c, False)
+                time.sleep(0.5)
             the_unit.screen_off()
-    except DUTError as e:
-        print (e.message)
-    finally:
-        if the_unit is not None:
+        except Exception as e:
+            print(e)
+        finally:
             time.sleep(2)
             the_unit.close()
